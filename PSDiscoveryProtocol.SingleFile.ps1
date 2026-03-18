@@ -7,7 +7,7 @@ param(
     [switch]$ShowVersion
 )
 
-$script:PSDiscoveryProtocolVersion = '1.5.0'
+$script:PSDiscoveryProtocolVersion = '1.5.1'
 
 $script:PSDiscoveryProtocolSource = @'
 #region classes
@@ -112,6 +112,37 @@ class DiscoveryProtocolPacket {
             return [bool]($FirstTlvType -eq 1 -and $FirstTlvLength -eq 6)
         }
     }
+}
+#endregion
+
+#region helper functions
+function ConvertTo-PSDPMacAddress {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [byte[]]$Bytes
+    )
+
+    if ($Bytes.Length -eq 0) {
+        return [string]::Empty
+    }
+
+    ($Bytes | ForEach-Object { $_.ToString('X2') }) -join ':'
+}
+
+function ConvertTo-PSDPUptimeString {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [uint32]$Seconds
+    )
+
+    $TimeSpan = [TimeSpan]::FromSeconds($Seconds)
+    if ($TimeSpan.Days -gt 0) {
+        return ('{0}d {1:00}:{2:00}:{3:00}' -f $TimeSpan.Days, $TimeSpan.Hours, $TimeSpan.Minutes, $TimeSpan.Seconds)
+    }
+
+    return ('{0:00}:{1:00}:{2:00}' -f $TimeSpan.Hours, $TimeSpan.Minutes, $TimeSpan.Seconds)
 }
 #endregion
 
@@ -232,7 +263,7 @@ function Invoke-DiscoveryProtocolCapture {
             Position = 0)]
         [Parameter(ParameterSetName = 'RemoteCapture',
             Position = 1)]
-        [Int16]$Duration = $(if ($Type -in 'LLDP', 'MNDP') { 32 } else { 62 }),
+        [Int16]$Duration = $(if ($Type -eq 'LLDP') { 32 } elseif ($Type -eq 'MNDP') { 65 } else { 62 }),
 
         [Parameter(ParameterSetName = 'LocalCapture',
             Position = 1)]
@@ -349,9 +380,19 @@ function Invoke-DiscoveryProtocolCapture {
                 if ($Force.IsPresent) {
                     Get-NetEventSession @CimSession | ForEach-Object {
                         if ($_.SessionStatus -eq 'Running') {
-                            $_ | Stop-NetEventSession @CimSession
+                            try {
+                                $_ | Stop-NetEventSession @CimSession -ErrorAction Stop
+                            }
+                            catch {
+                                Write-Verbose "Unable to stop existing NetEventSession '$($_.Name)' on $Computer. $_"
+                            }
                         }
-                        $_ | Remove-NetEventSession @CimSession
+                        try {
+                            $_ | Remove-NetEventSession @CimSession -ErrorAction Stop
+                        }
+                        catch {
+                            Write-Verbose "Unable to remove existing NetEventSession '$($_.Name)' on $Computer. $_"
+                        }
                     }
                 }
 
@@ -383,36 +424,89 @@ function Invoke-DiscoveryProtocolCapture {
                     LinkLayerAddress = $LinkLayerAddress
                 }
 
-                Add-NetEventPacketCaptureProvider @PacketCaptureParams @CimSession | Out-Null
-
-                foreach ($Adapter in $Adapters) {
-                    Add-NetEventNetworkAdapter -Name $Adapter.Name -PromiscuousMode $True @CimSession | Out-Null
+                try {
+                    Add-NetEventPacketCaptureProvider @PacketCaptureParams @CimSession -ErrorAction Stop | Out-Null
+                }
+                catch {
+                    Write-Warning "Unable to add packet capture provider on $Computer. $_"
+                    Remove-NetEventSession -Name $SessionName @CimSession -ErrorAction SilentlyContinue
+                    continue
                 }
 
-                Start-NetEventSession -Name $SessionName @CimSession
+                $EnabledAdapters = @()
+                foreach ($Adapter in $Adapters) {
+                    try {
+                        Add-NetEventNetworkAdapter -Name $Adapter.Name -PromiscuousMode $True @CimSession -ErrorAction Stop | Out-Null
+                        $EnabledAdapters += $Adapter
+                    }
+                    catch {
+                        Write-Verbose "Skipping adapter '$($Adapter.Name)' on $Computer. $_"
+                    }
+                }
+
+                if (-not $EnabledAdapters) {
+                    Write-Warning "No compatible adapters could be added to capture session on $Computer."
+                    Remove-NetEventSession -Name $SessionName @CimSession -ErrorAction SilentlyContinue
+                    continue
+                }
+
+                try {
+                    Start-NetEventSession -Name $SessionName @CimSession -ErrorAction Stop
+                }
+                catch {
+                    Write-Warning "Unable to start capture session on $Computer. $_"
+                    try {
+                        Remove-NetEventSession -Name $SessionName @CimSession -ErrorAction SilentlyContinue
+                    }
+                    catch {
+                    }
+                    continue
+                }
 
                 $Seconds = $Duration
                 $End = (Get-Date).AddSeconds($Seconds)
+                $LastProgressLength = 0
                 while ($End -gt (Get-Date)) {
                     $SecondsLeft = $End.Subtract((Get-Date)).TotalSeconds
                     $Percent = ($Seconds - $SecondsLeft) / $Seconds * 100
-                    Write-Progress -Activity "Discovery Protocol Packet Capture" -Status "Capturing on $Computer..." -SecondsRemaining $SecondsLeft -PercentComplete $Percent
-                    # Fallback progress for hosts where Write-Progress UI is not rendered (for example packaged EXE hosts).
                     try {
-                        $Line = ("`rCapturing on {0}... {1}s remaining" -f $Computer, [int][Math]::Ceiling($SecondsLeft))
-                        [Console]::Write($Line)
+                        Write-Progress -Activity "Discovery Protocol Packet Capture" -Status "Capturing on $Computer..." -SecondsRemaining $SecondsLeft -PercentComplete $Percent
                     }
                     catch {
+                    }
+                    # Use console countdown text for broad host compatibility (including packaged EXE hosts).
+                    try {
+                        $Line = ("Capturing on {0}... {1}s remaining" -f $Computer, [int][Math]::Ceiling($SecondsLeft))
+                        $PaddingLength = [Math]::Max(0, $LastProgressLength - $Line.Length)
+                        $Padding = if ($PaddingLength -gt 0) { ' ' * $PaddingLength } else { '' }
+                        [Console]::Write("`r$Line$Padding")
+                        $LastProgressLength = $Line.Length
+                    }
+                    catch {
+                        # Silent fallback when console host does not support cursor writing.
                     }
                     [System.Threading.Thread]::Sleep(500)
                 }
                 try {
+                    if ($LastProgressLength -gt 0) {
+                        [Console]::Write("`r$(' ' * $LastProgressLength)`r")
+                    }
                     [Console]::WriteLine()
                 }
                 catch {
                 }
+                try {
+                    Write-Progress -Activity "Discovery Protocol Packet Capture" -Completed
+                }
+                catch {
+                }
 
-                Stop-NetEventSession -Name $SessionName @CimSession
+                try {
+                    Stop-NetEventSession -Name $SessionName @CimSession -ErrorAction Stop
+                }
+                catch {
+                    Write-Verbose "Unable to stop capture session '$SessionName' on $Computer. $_"
+                }
 
                 $Events = Invoke-Command @PSSession -ScriptBlock {
                     param(
@@ -458,7 +552,12 @@ function Invoke-DiscoveryProtocolCapture {
                     $_.Group | Select-Object -First 1
                 }
 
-                Remove-NetEventSession -Name $SessionName @CimSession
+                try {
+                    Remove-NetEventSession -Name $SessionName @CimSession -ErrorAction Stop
+                }
+                catch {
+                    Write-Verbose "Unable to remove capture session '$SessionName' on $Computer. $_"
+                }
 
                 if (-not $NoCleanup.IsPresent) {
                     Invoke-Command @PSSession -ScriptBlock {
@@ -1718,7 +1817,7 @@ function ConvertFrom-MNDPPacket {
         switch ($TlvType) {
             1 {
                 if ($TlvLength -eq 6) {
-                    $Hash.MACAddress = [PhysicalAddress]::new($ValueBytes).ToString()
+                    $Hash.MACAddress = ConvertTo-PSDPMacAddress -Bytes $ValueBytes
                 }
             }
             5 {
@@ -1734,9 +1833,12 @@ function ConvertFrom-MNDPPacket {
             }
             10 {
                 if ($TlvLength -eq 4) {
-                    $Seconds = [BitConverter]::ToUInt32($ValueBytes[3..0], 0)
+                    $UptimeRaw = [BitConverter]::ToUInt32($ValueBytes[3..0], 0)
+                    $Seconds = [uint32][Math]::Floor($UptimeRaw / 100)
+                    $Hash.UptimeRaw = $UptimeRaw
                     $Hash.UptimeSeconds = $Seconds
-                    $Hash.Uptime = [TimeSpan]::FromSeconds($Seconds)
+                    $Hash.UptimeTimeSpan = [TimeSpan]::FromSeconds($Seconds)
+                    $Hash.Uptime = ConvertTo-PSDPUptimeString -Seconds $Seconds
                 }
             }
             11 { $Hash.SoftwareID = [System.Text.Encoding]::ASCII.GetString($ValueBytes) }
@@ -1970,6 +2072,9 @@ if ($ShowVersion) {
 }
 
 if ($Command) {
+    if ($Command -eq 'Invoke-DiscoveryProtocolCapture' -and -not $Arguments.ContainsKey('Force')) {
+        $Arguments['Force'] = $true
+    }
     & $Command @Arguments
     return
 }
@@ -1991,29 +2096,58 @@ function Convert-DisplayValue {
         foreach ($entry in $Value) {
             if ($entry -is [string]) { $parts += $entry }
             elseif ($entry -is [ValueType]) { $parts += [string]$entry }
-            else { $parts += ($entry | ConvertTo-Json -Compress -Depth 6) }
+            elseif ($entry.PSObject -and $entry.PSObject.Properties.Count -gt 0) {
+                $pairs = @()
+                foreach ($p in $entry.PSObject.Properties) {
+                    if ($p.Name -notlike 'PS*') {
+                        $pairs += ("{0}={1}" -f $p.Name, (Convert-DisplayValue -Value $p.Value))
+                    }
+                }
+                $parts += ($pairs -join '; ')
+            }
+            else { $parts += [string]$entry }
         }
-        return ($parts -join ', ')
+        return ($parts -join ' | ')
     }
     if ($Value -is [ValueType]) { return [string]$Value }
-    return ($Value | ConvertTo-Json -Compress -Depth 6)
+    if ($Value.PSObject -and $Value.PSObject.Properties.Count -gt 0) {
+        $pairs = @()
+        foreach ($p in $Value.PSObject.Properties) {
+            if ($p.Name -notlike 'PS*') {
+                $pairs += ("{0}={1}" -f $p.Name, (Convert-DisplayValue -Value $p.Value))
+            }
+        }
+        return ($pairs -join '; ')
+    }
+    return [string]$Value
 }
 
 function Show-DiscoveryResult {
     param([psobject]$Item, [string[]]$Fields)
     foreach ($name in $Fields) {
         $raw = $Item.PSObject.Properties[$name].Value
-        $text = Convert-DisplayValue -Value $raw
+        if ($name -eq 'LinkAggregation' -and $raw) {
+            $state = @()
+            if ($raw.Capable) { $state += 'Capable' } else { $state += 'Not Capable' }
+            if ($raw.Enabled) { $state += 'Enabled' } else { $state += 'Disabled' }
+            $text = ("{0}; PortId={1}; Status=0x{2}" -f ($state -join ', '), $raw.PortId, ([int]$raw.Status).ToString('X2'))
+        }
+        else {
+            $text = Convert-DisplayValue -Value $raw
+        }
         Write-Host ($name + ': ' + $text)
     }
 }
 
 do {
     Clear-Host
-    Write-Host "========================================" -ForegroundColor Blue
-    Write-Host "    Network Discovery Tool (CDP/LLDP)   " -ForegroundColor White
-    Write-Host ("    Version: {0}" -f $script:PSDiscoveryProtocolVersion) -ForegroundColor DarkCyan
-    Write-Host "========================================" -ForegroundColor Blue
+    $HeaderWidth = 40
+    $TitleLine = 'Network Discovery Tool'
+    $VersionLine = "Version: $script:PSDiscoveryProtocolVersion"
+    Write-Host ('=' * $HeaderWidth) -ForegroundColor Blue
+    Write-Host ($TitleLine.PadLeft([Math]::Floor(($HeaderWidth + $TitleLine.Length) / 2)).PadRight($HeaderWidth)) -ForegroundColor White
+    Write-Host ($VersionLine.PadLeft([Math]::Floor(($HeaderWidth + $VersionLine.Length) / 2)).PadRight($HeaderWidth)) -ForegroundColor DarkCyan
+    Write-Host ('=' * $HeaderWidth) -ForegroundColor Blue
     Write-Host "1. Capture CDP (Cisco)"
     Write-Host "2. Capture LLDP (Standard)"
     Write-Host "3. Capture MNDP (MikroTik)"
@@ -2026,7 +2160,7 @@ do {
             '2' { 'LLDP' }
             '3' { 'MNDP' }
         }
-        $duration = if ($type -eq 'CDP') { 65 } else { 35 }
+        $duration = if ($type -eq 'CDP') { 65 } elseif ($type -eq 'MNDP') { 65 } else { 35 }
 
         Write-Host "
 [!] Capturing $type... Please wait for a network advertisement." -ForegroundColor Yellow

@@ -78,6 +78,9 @@ if (`$ShowVersion) {
 }
 
 if (`$Command) {
+    if (`$Command -eq 'Invoke-DiscoveryProtocolCapture' -and -not `$Arguments.ContainsKey('Force')) {
+        `$Arguments['Force'] = `$true
+    }
     & `$Command @Arguments
     return
 }
@@ -99,29 +102,58 @@ function Convert-DisplayValue {
         foreach (`$entry in `$Value) {
             if (`$entry -is [string]) { `$parts += `$entry }
             elseif (`$entry -is [ValueType]) { `$parts += [string]`$entry }
-            else { `$parts += (`$entry | ConvertTo-Json -Compress -Depth 6) }
+            elseif (`$entry.PSObject -and `$entry.PSObject.Properties.Count -gt 0) {
+                `$pairs = @()
+                foreach (`$p in `$entry.PSObject.Properties) {
+                    if (`$p.Name -notlike 'PS*') {
+                        `$pairs += ("{0}={1}" -f `$p.Name, (Convert-DisplayValue -Value `$p.Value))
+                    }
+                }
+                `$parts += (`$pairs -join '; ')
+            }
+            else { `$parts += [string]`$entry }
         }
-        return (`$parts -join ', ')
+        return (`$parts -join ' | ')
     }
     if (`$Value -is [ValueType]) { return [string]`$Value }
-    return (`$Value | ConvertTo-Json -Compress -Depth 6)
+    if (`$Value.PSObject -and `$Value.PSObject.Properties.Count -gt 0) {
+        `$pairs = @()
+        foreach (`$p in `$Value.PSObject.Properties) {
+            if (`$p.Name -notlike 'PS*') {
+                `$pairs += ("{0}={1}" -f `$p.Name, (Convert-DisplayValue -Value `$p.Value))
+            }
+        }
+        return (`$pairs -join '; ')
+    }
+    return [string]`$Value
 }
 
 function Show-DiscoveryResult {
     param([psobject]`$Item, [string[]]`$Fields)
     foreach (`$name in `$Fields) {
         `$raw = `$Item.PSObject.Properties[`$name].Value
-        `$text = Convert-DisplayValue -Value `$raw
+        if (`$name -eq 'LinkAggregation' -and `$raw) {
+            `$state = @()
+            if (`$raw.Capable) { `$state += 'Capable' } else { `$state += 'Not Capable' }
+            if (`$raw.Enabled) { `$state += 'Enabled' } else { `$state += 'Disabled' }
+            `$text = ("{0}; PortId={1}; Status=0x{2}" -f (`$state -join ', '), `$raw.PortId, ([int]`$raw.Status).ToString('X2'))
+        }
+        else {
+            `$text = Convert-DisplayValue -Value `$raw
+        }
         Write-Host (`$name + ': ' + `$text)
     }
 }
 
 do {
     Clear-Host
-    Write-Host "========================================" -ForegroundColor Blue
-    Write-Host "    Network Discovery Tool (CDP/LLDP)   " -ForegroundColor White
-    Write-Host ("    Version: {0}" -f `$script:PSDiscoveryProtocolVersion) -ForegroundColor DarkCyan
-    Write-Host "========================================" -ForegroundColor Blue
+    `$HeaderWidth = 40
+    `$TitleLine = 'Network Discovery Tool'
+    `$VersionLine = "Version: `$script:PSDiscoveryProtocolVersion"
+    Write-Host ('=' * `$HeaderWidth) -ForegroundColor Blue
+    Write-Host (`$TitleLine.PadLeft([Math]::Floor((`$HeaderWidth + `$TitleLine.Length) / 2)).PadRight(`$HeaderWidth)) -ForegroundColor White
+    Write-Host (`$VersionLine.PadLeft([Math]::Floor((`$HeaderWidth + `$VersionLine.Length) / 2)).PadRight(`$HeaderWidth)) -ForegroundColor DarkCyan
+    Write-Host ('=' * `$HeaderWidth) -ForegroundColor Blue
     Write-Host "1. Capture CDP (Cisco)"
     Write-Host "2. Capture LLDP (Standard)"
     Write-Host "3. Capture MNDP (MikroTik)"
@@ -134,7 +166,7 @@ do {
             '2' { 'LLDP' }
             '3' { 'MNDP' }
         }
-        `$duration = if (`$type -eq 'CDP') { 65 } else { 35 }
+        `$duration = if (`$type -eq 'CDP') { 65 } elseif (`$type -eq 'MNDP') { 65 } else { 35 }
 
         Write-Host "`n[!] Capturing `$type... Please wait for a network advertisement." -ForegroundColor Yellow
         `$captureWarnings = @()
