@@ -30,7 +30,7 @@ $moduleVersion = [string]$manifest.ModuleVersion
 $singleFile = @"
 [CmdletBinding()]
 param(
-    [ValidateSet('Invoke-DiscoveryProtocolCapture', 'Get-DiscoveryProtocolData', 'ConvertFrom-CDPPacket', 'ConvertFrom-LLDPPacket', 'Export-Pcap', 'Get-PSDiscoveryProtocolVersion')]
+    [ValidateSet('Invoke-DiscoveryProtocolCapture', 'Get-DiscoveryProtocolData', 'ConvertFrom-CDPPacket', 'ConvertFrom-LLDPPacket', 'ConvertFrom-MNDPPacket', 'Export-Pcap', 'Get-PSDiscoveryProtocolVersion')]
     [string]`$Command,
     [hashtable]`$Arguments = @{},
     [switch]`$ListCommands,
@@ -124,12 +124,17 @@ do {
     Write-Host "========================================" -ForegroundColor Blue
     Write-Host "1. Capture CDP (Cisco)"
     Write-Host "2. Capture LLDP (Standard)"
-    Write-Host "3. Exit"
-    `$choice = Read-Host "Select [1-3]"
+    Write-Host "3. Capture MNDP (MikroTik)"
+    Write-Host "4. Exit"
+    `$choice = Read-Host "Select [1-4]"
 
-    if (`$choice -eq '1' -or `$choice -eq '2') {
-        `$type = if (`$choice -eq '1') { 'CDP' } else { 'LLDP' }
-        `$duration = if (`$type -eq 'LLDP') { 35 } else { 65 }
+    if (`$choice -in '1', '2', '3') {
+        `$type = switch (`$choice) {
+            '1' { 'CDP' }
+            '2' { 'LLDP' }
+            '3' { 'MNDP' }
+        }
+        `$duration = if (`$type -eq 'CDP') { 65 } else { 35 }
 
         Write-Host "`n[!] Capturing `$type... Please wait for a network advertisement." -ForegroundColor Yellow
         `$captureWarnings = @()
@@ -152,8 +157,12 @@ do {
                 `$fields = 'Device','SystemName','SoftwareVersion','Model','IPAddress','Management','VLAN','Port','Capabilities','Duplex','TrustBitmap','UntrustedPortCoS','Connection','Interface','Computer','Type'
                 Show-DiscoveryResult -Item `$item -Fields `$fields
             }
-            else {
+            elseif (`$type -eq 'LLDP') {
                 `$fields = 'Device','SystemName','SystemDescription','Model','IPAddress','ManagementAddresses','VLAN','VLANNamedEntries','Port','PortDescription','ChassisId','ChassisIdSubtype','ChassisIdSubtypeName','PortIdSubtype','PortIdSubtypeName','TimeToLive','SystemCapabilities','EnabledCapabilities','LinkAggregation','MacPhyConfigurationStatus','ManagementInterfaceNumberingSubtype','ManagementInterfaceNumber','ManagementObjectIdentifier','Connection','Interface','Computer','Type'
+                Show-DiscoveryResult -Item `$item -Fields `$fields
+            }
+            else {
+                `$fields = 'Device','SoftwareVersion','SoftwareID','Platform','Board','Model','Port','InterfaceName','IPAddress','IPv6Address','MACAddress','Uptime','UptimeSeconds','Unpack','Connection','Interface','Computer','Type'
                 Show-DiscoveryResult -Item `$item -Fields `$fields
             }
             }
@@ -172,7 +181,7 @@ do {
         Write-Host "`n----------------------------------------"
         Pause
     }
-} while (`$choice -ne '3')
+} while (`$choice -ne '4')
 "@
 
 [System.IO.File]::WriteAllText(

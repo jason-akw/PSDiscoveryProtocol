@@ -20,7 +20,8 @@ class DiscoveryProtocolPacket {
         Add-Member -InputObject $this -MemberType ScriptProperty -Name IsDiscoveryProtocolPacket -Value {
             if (
                 [UInt16]0x2000 -eq [BitConverter]::ToUInt16($this.Fragment[21..20], 0) -or
-                [UInt16]0x88CC -eq [BitConverter]::ToUInt16($this.Fragment[13..12], 0)
+                [UInt16]0x88CC -eq [BitConverter]::ToUInt16($this.Fragment[13..12], 0) -or
+                $this.TestMNDPPacket()
             ) { return [bool]$true } else { return [bool]$false }
         }
 
@@ -31,6 +32,9 @@ class DiscoveryProtocolPacket {
             elseif ([UInt16]0x88CC -eq [BitConverter]::ToUInt16($this.Fragment[13..12], 0)) {
                 return [string]'LLDP'
             }
+            elseif ($this.TestMNDPPacket()) {
+                return [string]'MNDP'
+            }
             else {
                 return [string]::Empty
             }
@@ -38,6 +42,62 @@ class DiscoveryProtocolPacket {
 
         Add-Member -InputObject $this -MemberType ScriptProperty -Name SourceAddress -Value {
             [PhysicalAddress]::new($this.Fragment[6..11]).ToString()
+        }
+
+        Add-Member -InputObject $this -MemberType ScriptMethod -Name TestMNDPPacket -Value {
+            $Frame = $this.Fragment
+            if (-not $Frame -or $Frame.Length -lt 46) {
+                return [bool]$false
+            }
+
+            $Offset = 12
+            $EtherType = [BitConverter]::ToUInt16($Frame[($Offset + 1)..$Offset], 0)
+            $L3Offset = 14
+
+            if ($EtherType -in 0x8100, 0x88A8) {
+                if ($Frame.Length -lt 50) {
+                    return [bool]$false
+                }
+
+                $EtherType = [BitConverter]::ToUInt16($Frame[17..16], 0)
+                $L3Offset = 18
+            }
+
+            if ($EtherType -ne 0x0800) {
+                return [bool]$false
+            }
+
+            if ($Frame.Length -lt ($L3Offset + 20)) {
+                return [bool]$false
+            }
+
+            $Ihl = ($Frame[$L3Offset] -band 0x0F) * 4
+            if ($Ihl -lt 20 -or $Frame.Length -lt ($L3Offset + $Ihl + 8)) {
+                return [bool]$false
+            }
+
+            $Protocol = $Frame[$L3Offset + 9]
+            if ($Protocol -ne 17) {
+                return [bool]$false
+            }
+
+            $UdpOffset = $L3Offset + $Ihl
+            $SourcePort = [BitConverter]::ToUInt16($Frame[($UdpOffset + 1)..$UdpOffset], 0)
+            $DestinationPort = [BitConverter]::ToUInt16($Frame[($UdpOffset + 3)..($UdpOffset + 2)], 0)
+
+            if ($SourcePort -ne 5678 -and $DestinationPort -ne 5678) {
+                return [bool]$false
+            }
+
+            $PayloadOffset = $UdpOffset + 8
+            if ($Frame.Length -lt ($PayloadOffset + 8)) {
+                return [bool]$false
+            }
+
+            $FirstTlvType = [BitConverter]::ToUInt16($Frame[($PayloadOffset + 5)..($PayloadOffset + 4)], 0)
+            $FirstTlvLength = [BitConverter]::ToUInt16($Frame[($PayloadOffset + 7)..($PayloadOffset + 6)], 0)
+
+            return [bool]($FirstTlvType -eq 1 -and $FirstTlvLength -eq 6)
         }
     }
 }
@@ -160,13 +220,13 @@ function Invoke-DiscoveryProtocolCapture {
             Position = 0)]
         [Parameter(ParameterSetName = 'RemoteCapture',
             Position = 1)]
-        [Int16]$Duration = $(if ($Type -eq 'LLDP') { 32 } else { 62 }),
+        [Int16]$Duration = $(if ($Type -in 'LLDP', 'MNDP') { 32 } else { 62 }),
 
         [Parameter(ParameterSetName = 'LocalCapture',
             Position = 1)]
         [Parameter(ParameterSetName = 'RemoteCapture',
             Position = 2)]
-        [ValidateSet('CDP', 'LLDP')]
+        [ValidateSet('CDP', 'LLDP', 'MNDP')]
         [String]$Type,
 
         [Parameter(ParameterSetName = 'RemoteCapture')]
@@ -300,7 +360,8 @@ function Invoke-DiscoveryProtocolCapture {
                 $LinkLayerAddress = switch ($Type) {
                     'CDP' { '01-00-0c-cc-cc-cc' }
                     'LLDP' { '01-80-c2-00-00-0e', '01-80-c2-00-00-03', '01-80-c2-00-00-00' }
-                    Default { '01-00-0c-cc-cc-cc', '01-80-c2-00-00-0e', '01-80-c2-00-00-03', '01-80-c2-00-00-00' }
+                    'MNDP' { 'ff-ff-ff-ff-ff-ff' }
+                    Default { '01-00-0c-cc-cc-cc', '01-80-c2-00-00-0e', '01-80-c2-00-00-03', '01-80-c2-00-00-00', 'ff-ff-ff-ff-ff-ff' }
                 }
 
                 $PacketCaptureParams = @{
@@ -511,7 +572,8 @@ function Get-DiscoveryProtocolData {
             switch ($Item.DiscoveryProtocolType) {
                 'CDP' { $PacketData = ConvertFrom-CDPPacket -Packet $Item.Fragment }
                 'LLDP' { $PacketData = ConvertFrom-LLDPPacket -Packet $Item.Fragment }
-                Default { throw 'No valid CDP or LLDP found in $Packet' }
+                'MNDP' { $PacketData = ConvertFrom-MNDPPacket -Packet $Item.Fragment }
+                Default { throw 'No valid CDP, LLDP, or MNDP found in $Packet' }
             }
 
             $PacketData | Add-Member -NotePropertyName Computer -NotePropertyValue $Item.MachineName
@@ -1541,6 +1603,171 @@ function ConvertFrom-LLDPPacket {
     }
 
     end {}
+}
+#endregion
+
+#region function ConvertFrom-MNDPPacket
+function ConvertFrom-MNDPPacket {
+
+    <#
+
+.SYNOPSIS
+
+    Parse MNDP packet.
+
+.DESCRIPTION
+
+    Parse MikroTik Neighbor Discovery Protocol (MNDP) packet over UDP/5678.
+
+.PARAMETER Packet
+
+    Raw packet as byte array.
+
+#>
+
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0, Mandatory = $true)]
+        [byte[]]$Packet
+    )
+
+    $Offset = 12
+    $EtherType = [BitConverter]::ToUInt16($Packet[($Offset + 1)..$Offset], 0)
+    $L3Offset = 14
+
+    if ($EtherType -in 0x8100, 0x88A8) {
+        $EtherType = [BitConverter]::ToUInt16($Packet[17..16], 0)
+        $L3Offset = 18
+    }
+
+    if ($EtherType -ne 0x0800) {
+        throw 'Not an IPv4 packet'
+    }
+
+    $Ihl = ($Packet[$L3Offset] -band 0x0F) * 4
+    if ($Ihl -lt 20) {
+        throw 'Invalid IPv4 header length'
+    }
+
+    if ($Packet[$L3Offset + 9] -ne 17) {
+        throw 'Not a UDP packet'
+    }
+
+    $UdpOffset = $L3Offset + $Ihl
+    $SourcePort = [BitConverter]::ToUInt16($Packet[($UdpOffset + 1)..$UdpOffset], 0)
+    $DestinationPort = [BitConverter]::ToUInt16($Packet[($UdpOffset + 3)..($UdpOffset + 2)], 0)
+
+    if ($SourcePort -ne 5678 -and $DestinationPort -ne 5678) {
+        throw 'Not an MNDP packet (UDP/5678)'
+    }
+
+    $PayloadOffset = $UdpOffset + 8
+    if ($Packet.Length -lt ($PayloadOffset + 4)) {
+        throw 'MNDP payload too short'
+    }
+
+    $Hash = @{
+        SourcePort = $SourcePort
+        DestinationPort = $DestinationPort
+        SequenceNumber = [BitConverter]::ToUInt16($Packet[($PayloadOffset + 3)..($PayloadOffset + 2)], 0)
+    }
+
+    $TlvTypeMap = @{
+        1 = 'MACAddress'
+        5 = 'Identity'
+        7 = 'SoftwareVersion'
+        8 = 'Platform'
+        10 = 'Uptime'
+        11 = 'SoftwareID'
+        12 = 'Board'
+        14 = 'Unpack'
+        15 = 'IPv6Address'
+        16 = 'InterfaceName'
+        17 = 'IPv4Address'
+    }
+
+    $UnpackMap = @{
+        1 = 'None'
+    }
+
+    $Cursor = $PayloadOffset + 4
+    while (($Cursor + 3) -lt $Packet.Length) {
+        $TlvType = [BitConverter]::ToUInt16($Packet[($Cursor + 1)..$Cursor], 0)
+        $TlvLength = [BitConverter]::ToUInt16($Packet[($Cursor + 3)..($Cursor + 2)], 0)
+        $Cursor += 4
+
+        if ($TlvLength -lt 0 -or ($Cursor + $TlvLength) -gt $Packet.Length) {
+            break
+        }
+
+        $ValueBytes = $Packet[$Cursor..($Cursor + $TlvLength - 1)]
+        $Cursor += $TlvLength
+
+        switch ($TlvType) {
+            1 {
+                if ($TlvLength -eq 6) {
+                    $Hash.MACAddress = [PhysicalAddress]::new($ValueBytes).ToString()
+                }
+            }
+            5 {
+                $Hash.Device = [System.Text.Encoding]::ASCII.GetString($ValueBytes)
+                $Hash.Identity = $Hash.Device
+            }
+            7 { $Hash.SoftwareVersion = [System.Text.Encoding]::ASCII.GetString($ValueBytes) }
+            8 {
+                $Hash.Platform = [System.Text.Encoding]::ASCII.GetString($ValueBytes)
+                if (-not $Hash.ContainsKey('Model')) {
+                    $Hash.Model = $Hash.Platform
+                }
+            }
+            10 {
+                if ($TlvLength -eq 4) {
+                    $Seconds = [BitConverter]::ToUInt32($ValueBytes[3..0], 0)
+                    $Hash.UptimeSeconds = $Seconds
+                    $Hash.Uptime = [TimeSpan]::FromSeconds($Seconds)
+                }
+            }
+            11 { $Hash.SoftwareID = [System.Text.Encoding]::ASCII.GetString($ValueBytes) }
+            12 { $Hash.Board = [System.Text.Encoding]::ASCII.GetString($ValueBytes) }
+            14 {
+                if ($TlvLength -ge 1) {
+                    $Raw = $ValueBytes[0]
+                    $Hash.UnpackRaw = $Raw
+                    $Hash.Unpack = $(if ($UnpackMap.ContainsKey($Raw)) { $UnpackMap[$Raw] } else { "Unknown($Raw)" })
+                }
+            }
+            15 {
+                if ($TlvLength -eq 16) {
+                    if (-not $Hash.ContainsKey('IPv6Address')) {
+                        $Hash.IPv6Address = New-Object System.Collections.Generic.List[String]
+                    }
+                    $Hash.IPv6Address.Add(([System.Net.IPAddress][byte[]]$ValueBytes).IPAddressToString)
+                }
+            }
+            16 {
+                $Hash.InterfaceName = [System.Text.Encoding]::ASCII.GetString($ValueBytes)
+                if (-not $Hash.ContainsKey('Port')) {
+                    $Hash.Port = $Hash.InterfaceName
+                }
+            }
+            17 {
+                if ($TlvLength -eq 4) {
+                    if (-not $Hash.ContainsKey('IPAddress')) {
+                        $Hash.IPAddress = New-Object System.Collections.Generic.List[String]
+                    }
+                    $Hash.IPAddress.Add(([System.Net.IPAddress][byte[]]$ValueBytes).IPAddressToString)
+                }
+            }
+            default {
+                $Key = if ($TlvTypeMap.ContainsKey($TlvType)) { $TlvTypeMap[$TlvType] } else { "TLV$TlvType" }
+                if (-not $Hash.ContainsKey($Key)) {
+                    $Hash[$Key] = [System.BitConverter]::ToString($ValueBytes)
+                }
+            }
+        }
+    }
+
+    [PSCustomObject]$Hash
 }
 #endregion
 

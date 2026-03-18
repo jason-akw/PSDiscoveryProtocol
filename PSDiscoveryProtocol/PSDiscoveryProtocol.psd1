@@ -72,6 +72,7 @@ DotNetFrameworkVersion = '4.6.1'
 FunctionsToExport = @(
     'ConvertFrom-CDPPacket',
     'ConvertFrom-LLDPPacket',
+    'ConvertFrom-MNDPPacket',
     'Export-Pcap',
     'Get-PSDiscoveryProtocolVersion',
     'Get-DiscoveryProtocolData',
@@ -107,7 +108,7 @@ PrivateData = @{
     PSData = @{
 
         # Tags applied to this module. These help with module discovery in online galleries.
-        Tags = @('CDP', 'Cisco', 'LLDP', 'ETW', 'Capture', 'Parse', 'Packet', 'Windows')
+        Tags = @('CDP', 'Cisco', 'LLDP', 'MNDP', 'MikroTik', 'ETW', 'Capture', 'Parse', 'Packet', 'Windows')
 
         # A URL to the license for this module.
         LicenseUri = 'https://raw.githubusercontent.com/lahell/PSDiscoveryProtocol/master/LICENSE'
