@@ -7,7 +7,7 @@ param(
     [switch]$ShowVersion
 )
 
-$script:PSDiscoveryProtocolVersion = '1.5.1'
+$script:PSDiscoveryProtocolVersion = '1.5.2'
 
 $script:PSDiscoveryProtocolSource = @'
 #region classes
@@ -396,17 +396,54 @@ function Invoke-DiscoveryProtocolCapture {
                     }
                 }
 
-                try {
-                    New-NetEventSession -Name $SessionName -LocalFilePath $ETLFilePath -CaptureMode SaveToFile @CimSession -ErrorAction Stop | Out-Null
+                $SessionCreated = $false
+                $CreateSessionAttempts = 0
+                while (-not $SessionCreated -and $CreateSessionAttempts -lt 2) {
+                    $CreateSessionAttempts++
+                    try {
+                        New-NetEventSession -Name $SessionName -LocalFilePath $ETLFilePath -CaptureMode SaveToFile @CimSession -ErrorAction Stop | Out-Null
+                        $SessionCreated = $true
+                    }
+                    catch [Microsoft.Management.Infrastructure.CimException] {
+                        if (
+                            $_.Exception.NativeErrorCode -eq 'AlreadyExists' -and
+                            $Force.IsPresent -and
+                            $CreateSessionAttempts -lt 2
+                        ) {
+                            Write-Verbose "Existing NetEventSession detected on $Computer. Retrying cleanup because -Force is set."
+                            Get-NetEventSession @CimSession | ForEach-Object {
+                                try {
+                                    if ($_.SessionStatus -eq 'Running') {
+                                        $_ | Stop-NetEventSession @CimSession -ErrorAction Stop
+                                    }
+                                }
+                                catch {
+                                    Write-Verbose "Unable to stop session '$($_.Name)' on retry cleanup. $_"
+                                }
+
+                                try {
+                                    $_ | Remove-NetEventSession @CimSession -ErrorAction Stop
+                                }
+                                catch {
+                                    Write-Verbose "Unable to remove session '$($_.Name)' on retry cleanup. $_"
+                                }
+                            }
+                            Start-Sleep -Milliseconds 300
+                            continue
+                        }
+
+                        if ($_.Exception.NativeErrorCode -eq 'AlreadyExists') {
+                            $Message = "Another NetEventSession already exists and could not be removed automatically."
+                            Write-Error -Message $Message
+                        }
+                        else {
+                            Write-Error -ErrorRecord $_
+                        }
+                        break
+                    }
                 }
-                catch [Microsoft.Management.Infrastructure.CimException] {
-                    if ($_.Exception.NativeErrorCode -eq 'AlreadyExists') {
-                        $Message = "Another NetEventSession already exists. Run Invoke-DiscoveryProtocolCapture with -Force switch to remove existing NetEventSessions."
-                        Write-Error -Message $Message
-                    }
-                    else {
-                        Write-Error -ErrorRecord $_
-                    }
+
+                if (-not $SessionCreated) {
                     continue
                 }
 
@@ -2165,7 +2202,8 @@ do {
         Write-Host "
 [!] Capturing $type... Please wait for a network advertisement." -ForegroundColor Yellow
         $captureWarnings = @()
-        $packet = Invoke-DiscoveryProtocolCapture -Type $type -Duration $duration -Force -WarningVariable +captureWarnings
+        $captureErrors = @()
+        $packet = Invoke-DiscoveryProtocolCapture -Type $type -Duration $duration -Force -WarningVariable +captureWarnings -ErrorVariable +captureErrors
         $data = if ($packet) { $packet | Get-DiscoveryProtocolData } else { $null }
 
         Write-Host ""
@@ -2195,7 +2233,10 @@ do {
             }
         }
         else {
-            if ($captureWarnings.Count -gt 0) {
+            if ($captureErrors.Count -gt 0) {
+                Write-Host "Capture failed. Please fix the errors above and retry." -ForegroundColor Red
+            }
+            elseif ($captureWarnings.Count -gt 0) {
                 Write-Host "No data parsed. Capture details:" -ForegroundColor Yellow
                 $captureWarnings | ForEach-Object { Write-Host " - $_" -ForegroundColor DarkYellow }
             }

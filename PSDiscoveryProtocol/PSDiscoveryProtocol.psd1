@@ -12,7 +12,7 @@
 RootModule = 'PSDiscoveryProtocol'
 
 # Version number of this module.
-ModuleVersion = '1.5.1'
+ModuleVersion = '1.5.2'
 
 # Supported PSEditions
 CompatiblePSEditions = @('Desktop', 'Core')

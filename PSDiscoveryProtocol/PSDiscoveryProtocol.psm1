@@ -384,17 +384,54 @@ function Invoke-DiscoveryProtocolCapture {
                     }
                 }
 
-                try {
-                    New-NetEventSession -Name $SessionName -LocalFilePath $ETLFilePath -CaptureMode SaveToFile @CimSession -ErrorAction Stop | Out-Null
+                $SessionCreated = $false
+                $CreateSessionAttempts = 0
+                while (-not $SessionCreated -and $CreateSessionAttempts -lt 2) {
+                    $CreateSessionAttempts++
+                    try {
+                        New-NetEventSession -Name $SessionName -LocalFilePath $ETLFilePath -CaptureMode SaveToFile @CimSession -ErrorAction Stop | Out-Null
+                        $SessionCreated = $true
+                    }
+                    catch [Microsoft.Management.Infrastructure.CimException] {
+                        if (
+                            $_.Exception.NativeErrorCode -eq 'AlreadyExists' -and
+                            $Force.IsPresent -and
+                            $CreateSessionAttempts -lt 2
+                        ) {
+                            Write-Verbose "Existing NetEventSession detected on $Computer. Retrying cleanup because -Force is set."
+                            Get-NetEventSession @CimSession | ForEach-Object {
+                                try {
+                                    if ($_.SessionStatus -eq 'Running') {
+                                        $_ | Stop-NetEventSession @CimSession -ErrorAction Stop
+                                    }
+                                }
+                                catch {
+                                    Write-Verbose "Unable to stop session '$($_.Name)' on retry cleanup. $_"
+                                }
+
+                                try {
+                                    $_ | Remove-NetEventSession @CimSession -ErrorAction Stop
+                                }
+                                catch {
+                                    Write-Verbose "Unable to remove session '$($_.Name)' on retry cleanup. $_"
+                                }
+                            }
+                            Start-Sleep -Milliseconds 300
+                            continue
+                        }
+
+                        if ($_.Exception.NativeErrorCode -eq 'AlreadyExists') {
+                            $Message = "Another NetEventSession already exists and could not be removed automatically."
+                            Write-Error -Message $Message
+                        }
+                        else {
+                            Write-Error -ErrorRecord $_
+                        }
+                        break
+                    }
                 }
-                catch [Microsoft.Management.Infrastructure.CimException] {
-                    if ($_.Exception.NativeErrorCode -eq 'AlreadyExists') {
-                        $Message = "Another NetEventSession already exists. Run Invoke-DiscoveryProtocolCapture with -Force switch to remove existing NetEventSessions."
-                        Write-Error -Message $Message
-                    }
-                    else {
-                        Write-Error -ErrorRecord $_
-                    }
+
+                if (-not $SessionCreated) {
                     continue
                 }
 

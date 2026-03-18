@@ -170,7 +170,8 @@ do {
 
         Write-Host "`n[!] Capturing `$type... Please wait for a network advertisement." -ForegroundColor Yellow
         `$captureWarnings = @()
-        `$packet = Invoke-DiscoveryProtocolCapture -Type `$type -Duration `$duration -Force -WarningVariable +captureWarnings
+        `$captureErrors = @()
+        `$packet = Invoke-DiscoveryProtocolCapture -Type `$type -Duration `$duration -Force -WarningVariable +captureWarnings -ErrorVariable +captureErrors
         `$data = if (`$packet) { `$packet | Get-DiscoveryProtocolData } else { `$null }
 
         Write-Host ""
@@ -200,7 +201,10 @@ do {
             }
         }
         else {
-            if (`$captureWarnings.Count -gt 0) {
+            if (`$captureErrors.Count -gt 0) {
+                Write-Host "Capture failed. Please fix the errors above and retry." -ForegroundColor Red
+            }
+            elseif (`$captureWarnings.Count -gt 0) {
                 Write-Host "No data parsed. Capture details:" -ForegroundColor Yellow
                 `$captureWarnings | ForEach-Object { Write-Host " - `$_" -ForegroundColor DarkYellow }
             }
