@@ -42,6 +42,16 @@ function Initialize-PSDiscoveryProtocolSingleFile {
 
 Initialize-PSDiscoveryProtocolSingleFile
 
+# Keep console behavior predictable in packaged EXE mode.
+`$ProgressPreference = 'Continue'
+try {
+    [Console]::InputEncoding = [System.Text.UTF8Encoding]::new(`$false)
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(`$false)
+    `$OutputEncoding = [Console]::OutputEncoding
+}
+catch {
+}
+
 if (`$ListCommands) {
     Get-Command -Module PSDiscoveryProtocol | Select-Object Name, CommandType
     return
@@ -58,6 +68,32 @@ if (-not `$principal.IsInRole([Security.Principal.WindowsBuiltinRole]::Administr
     Write-Host 'Administrator privileges are required for packet capture.' -ForegroundColor Red
     Write-Host 'Please run this script from an elevated terminal or use Run-PSDiscoveryProtocol.cmd.' -ForegroundColor Yellow
     return
+}
+
+function Convert-DisplayValue {
+    param([object]`$Value)
+    if (`$null -eq `$Value) { return '' }
+    if (`$Value -is [string]) { return `$Value }
+    if (`$Value -is [System.Collections.IEnumerable] -and -not (`$Value -is [string])) {
+        `$parts = @()
+        foreach (`$entry in `$Value) {
+            if (`$entry -is [string]) { `$parts += `$entry }
+            elseif (`$entry -is [ValueType]) { `$parts += [string]`$entry }
+            else { `$parts += (`$entry | ConvertTo-Json -Compress -Depth 6) }
+        }
+        return (`$parts -join ', ')
+    }
+    if (`$Value -is [ValueType]) { return [string]`$Value }
+    return (`$Value | ConvertTo-Json -Compress -Depth 6)
+}
+
+function Show-DiscoveryResult {
+    param([psobject]`$Item, [string[]]`$Fields)
+    foreach (`$name in `$Fields) {
+        `$raw = `$Item.PSObject.Properties[`$name].Value
+        `$text = Convert-DisplayValue -Value `$raw
+        Write-Host (`$name + ': ' + `$text)
+    }
 }
 
 do {
@@ -92,10 +128,12 @@ do {
                 Write-Host ("----- Result #{0} -----" -f `$resultIndex) -ForegroundColor Cyan
 
             if (`$type -eq 'CDP') {
-                `$item | Select-Object Device, SystemName, SoftwareVersion, Model, IPAddress, Management, VLAN, Port, Capabilities, Duplex, TrustBitmap, UntrustedPortCoS, Connection, Interface, Computer, Type | Format-List
+                `$fields = 'Device','SystemName','SoftwareVersion','Model','IPAddress','Management','VLAN','Port','Capabilities','Duplex','TrustBitmap','UntrustedPortCoS','Connection','Interface','Computer','Type'
+                Show-DiscoveryResult -Item `$item -Fields `$fields
             }
             else {
-                `$item | Select-Object Device, SystemName, SystemDescription, Model, IPAddress, ManagementAddresses, VLAN, VLANNamedEntries, Port, PortDescription, ChassisId, ChassisIdSubtype, ChassisIdSubtypeName, PortIdSubtype, PortIdSubtypeName, TimeToLive, SystemCapabilities, EnabledCapabilities, LinkAggregation, MacPhyConfigurationStatus, ManagementInterfaceNumberingSubtype, ManagementInterfaceNumber, ManagementObjectIdentifier, Connection, Interface, Computer, Type | Format-List
+                `$fields = 'Device','SystemName','SystemDescription','Model','IPAddress','ManagementAddresses','VLAN','VLANNamedEntries','Port','PortDescription','ChassisId','ChassisIdSubtype','ChassisIdSubtypeName','PortIdSubtype','PortIdSubtypeName','TimeToLive','SystemCapabilities','EnabledCapabilities','LinkAggregation','MacPhyConfigurationStatus','ManagementInterfaceNumberingSubtype','ManagementInterfaceNumber','ManagementObjectIdentifier','Connection','Interface','Computer','Type'
+                Show-DiscoveryResult -Item `$item -Fields `$fields
             }
             }
         }

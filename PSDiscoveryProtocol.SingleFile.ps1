@@ -333,7 +333,19 @@ function Invoke-DiscoveryProtocolCapture {
                     $SecondsLeft = $End.Subtract((Get-Date)).TotalSeconds
                     $Percent = ($Seconds - $SecondsLeft) / $Seconds * 100
                     Write-Progress -Activity "Discovery Protocol Packet Capture" -Status "Capturing on $Computer..." -SecondsRemaining $SecondsLeft -PercentComplete $Percent
+                    # Fallback progress for hosts where Write-Progress UI is not rendered (for example packaged EXE hosts).
+                    try {
+                        $Line = ("`rCapturing on {0}... {1}s remaining" -f $Computer, [int][Math]::Ceiling($SecondsLeft))
+                        [Console]::Write($Line)
+                    }
+                    catch {
+                    }
                     [System.Threading.Thread]::Sleep(500)
+                }
+                try {
+                    [Console]::WriteLine()
+                }
+                catch {
                 }
 
                 Stop-NetEventSession -Name $SessionName @CimSession
@@ -375,7 +387,10 @@ function Invoke-DiscoveryProtocolCapture {
 
                 $FoundPackets = $Events -as [DiscoveryProtocolPacket[]] | Where-Object {
                     $_.IsDiscoveryProtocolPacket -and $_.SourceAddress -notin $MACAddresses
-                } | Group-Object MiniportIfIndex | ForEach-Object {
+                } | Sort-Object TimeCreated | Group-Object {
+                    '{0}|{1}|{2}' -f $_.MiniportIfIndex, $_.SourceAddress, $_.DiscoveryProtocolType
+                } | ForEach-Object {
+                    # Return one packet per unique neighbor/source on each interface and protocol.
                     $_.Group | Select-Object -First 1
                 }
 
@@ -1164,18 +1179,35 @@ function ConvertFrom-LLDPPacket {
                             $Hash.Add('VLANNamedEntries', (New-Object System.Collections.Generic.List[Object]))
                         }
 
-                        $VlanId = [BitConverter]::ToUInt16($Packet[($Offset + 5)..($Offset + 4)], 0)
-                        $VlanNameLength = [int]$Packet[($Offset + 6)]
-                        $VlanName = [string]::Empty
+                        $TlvEnd = $Offset + $Length - 1
+                        $Cursor = $Offset + 4
 
-                        if ($VlanNameLength -gt 0 -and ($Offset + 7 + $VlanNameLength - 1) -le ($Offset + $Length - 1)) {
-                            $VlanName = [System.Text.Encoding]::ASCII.GetString($Packet[($Offset + 7)..($Offset + 7 + $VlanNameLength - 1)])
+                        while (($Cursor + 2) -le $TlvEnd) {
+                            if (($Cursor + 2) -gt $TlvEnd) {
+                                break
+                            }
+
+                            $VlanId = [BitConverter]::ToUInt16($Packet[($Cursor + 1)..$Cursor], 0)
+                            $VlanNameLength = [int]$Packet[($Cursor + 2)]
+                            $VlanNameStart = $Cursor + 3
+                            $VlanNameEnd = $VlanNameStart + $VlanNameLength - 1
+                            $VlanName = [string]::Empty
+
+                            if ($VlanNameLength -gt 0 -and $VlanNameEnd -le $TlvEnd) {
+                                $VlanName = [System.Text.Encoding]::ASCII.GetString($Packet[$VlanNameStart..$VlanNameEnd])
+                            }
+
+                            $Hash.VLANNamedEntries.Add([PSCustomObject]@{
+                                    VLANID = $VlanId
+                                    VLANName = $VlanName
+                                })
+
+                            if ($VlanNameLength -lt 0) {
+                                break
+                            }
+
+                            $Cursor = $VlanNameStart + [Math]::Max($VlanNameLength, 0)
                         }
-
-                        $Hash.VLANNamedEntries.Add([PSCustomObject]@{
-                                VLANID = $VlanId
-                                VLANName = $VlanName
-                            })
                     }
 
                     if ($OUI -eq '00-12-0F' -and $Subtype -eq 3 -and $Length -ge 9) {
@@ -1644,6 +1676,16 @@ function Initialize-PSDiscoveryProtocolSingleFile {
 
 Initialize-PSDiscoveryProtocolSingleFile
 
+# Keep console behavior predictable in packaged EXE mode.
+$ProgressPreference = 'Continue'
+try {
+    [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    $OutputEncoding = [Console]::OutputEncoding
+}
+catch {
+}
+
 if ($ListCommands) {
     Get-Command -Module PSDiscoveryProtocol | Select-Object Name, CommandType
     return
@@ -1660,6 +1702,32 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltinRole]::Administra
     Write-Host 'Administrator privileges are required for packet capture.' -ForegroundColor Red
     Write-Host 'Please run this script from an elevated terminal or use Run-PSDiscoveryProtocol.cmd.' -ForegroundColor Yellow
     return
+}
+
+function Convert-DisplayValue {
+    param([object]$Value)
+    if ($null -eq $Value) { return '' }
+    if ($Value -is [string]) { return $Value }
+    if ($Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])) {
+        $parts = @()
+        foreach ($entry in $Value) {
+            if ($entry -is [string]) { $parts += $entry }
+            elseif ($entry -is [ValueType]) { $parts += [string]$entry }
+            else { $parts += ($entry | ConvertTo-Json -Compress -Depth 6) }
+        }
+        return ($parts -join ', ')
+    }
+    if ($Value -is [ValueType]) { return [string]$Value }
+    return ($Value | ConvertTo-Json -Compress -Depth 6)
+}
+
+function Show-DiscoveryResult {
+    param([psobject]$Item, [string[]]$Fields)
+    foreach ($name in $Fields) {
+        $raw = $Item.PSObject.Properties[$name].Value
+        $text = Convert-DisplayValue -Value $raw
+        Write-Host ($name + ': ' + $text)
+    }
 }
 
 do {
@@ -1695,10 +1763,12 @@ do {
                 Write-Host ("----- Result #{0} -----" -f $resultIndex) -ForegroundColor Cyan
 
             if ($type -eq 'CDP') {
-                $item | Select-Object Device, SystemName, SoftwareVersion, Model, IPAddress, Management, VLAN, Port, Capabilities, Duplex, TrustBitmap, UntrustedPortCoS, Connection, Interface, Computer, Type | Format-List
+                $fields = 'Device','SystemName','SoftwareVersion','Model','IPAddress','Management','VLAN','Port','Capabilities','Duplex','TrustBitmap','UntrustedPortCoS','Connection','Interface','Computer','Type'
+                Show-DiscoveryResult -Item $item -Fields $fields
             }
             else {
-                $item | Select-Object Device, SystemName, SystemDescription, Model, IPAddress, ManagementAddresses, VLAN, VLANNamedEntries, Port, PortDescription, ChassisId, ChassisIdSubtype, ChassisIdSubtypeName, PortIdSubtype, PortIdSubtypeName, TimeToLive, SystemCapabilities, EnabledCapabilities, LinkAggregation, MacPhyConfigurationStatus, ManagementInterfaceNumberingSubtype, ManagementInterfaceNumber, ManagementObjectIdentifier, Connection, Interface, Computer, Type | Format-List
+                $fields = 'Device','SystemName','SystemDescription','Model','IPAddress','ManagementAddresses','VLAN','VLANNamedEntries','Port','PortDescription','ChassisId','ChassisIdSubtype','ChassisIdSubtypeName','PortIdSubtype','PortIdSubtypeName','TimeToLive','SystemCapabilities','EnabledCapabilities','LinkAggregation','MacPhyConfigurationStatus','ManagementInterfaceNumberingSubtype','ManagementInterfaceNumber','ManagementObjectIdentifier','Connection','Interface','Computer','Type'
+                Show-DiscoveryResult -Item $item -Fields $fields
             }
             }
         }

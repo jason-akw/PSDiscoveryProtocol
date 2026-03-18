@@ -324,7 +324,19 @@ function Invoke-DiscoveryProtocolCapture {
                     $SecondsLeft = $End.Subtract((Get-Date)).TotalSeconds
                     $Percent = ($Seconds - $SecondsLeft) / $Seconds * 100
                     Write-Progress -Activity "Discovery Protocol Packet Capture" -Status "Capturing on $Computer..." -SecondsRemaining $SecondsLeft -PercentComplete $Percent
+                    # Fallback progress for hosts where Write-Progress UI is not rendered (for example packaged EXE hosts).
+                    try {
+                        $Line = ("`rCapturing on {0}... {1}s remaining" -f $Computer, [int][Math]::Ceiling($SecondsLeft))
+                        [Console]::Write($Line)
+                    }
+                    catch {
+                    }
                     [System.Threading.Thread]::Sleep(500)
+                }
+                try {
+                    [Console]::WriteLine()
+                }
+                catch {
                 }
 
                 Stop-NetEventSession -Name $SessionName @CimSession
@@ -366,7 +378,10 @@ function Invoke-DiscoveryProtocolCapture {
 
                 $FoundPackets = $Events -as [DiscoveryProtocolPacket[]] | Where-Object {
                     $_.IsDiscoveryProtocolPacket -and $_.SourceAddress -notin $MACAddresses
-                } | Group-Object MiniportIfIndex | ForEach-Object {
+                } | Sort-Object TimeCreated | Group-Object {
+                    '{0}|{1}|{2}' -f $_.MiniportIfIndex, $_.SourceAddress, $_.DiscoveryProtocolType
+                } | ForEach-Object {
+                    # Return one packet per unique neighbor/source on each interface and protocol.
                     $_.Group | Select-Object -First 1
                 }
 
@@ -1155,18 +1170,35 @@ function ConvertFrom-LLDPPacket {
                             $Hash.Add('VLANNamedEntries', (New-Object System.Collections.Generic.List[Object]))
                         }
 
-                        $VlanId = [BitConverter]::ToUInt16($Packet[($Offset + 5)..($Offset + 4)], 0)
-                        $VlanNameLength = [int]$Packet[($Offset + 6)]
-                        $VlanName = [string]::Empty
+                        $TlvEnd = $Offset + $Length - 1
+                        $Cursor = $Offset + 4
 
-                        if ($VlanNameLength -gt 0 -and ($Offset + 7 + $VlanNameLength - 1) -le ($Offset + $Length - 1)) {
-                            $VlanName = [System.Text.Encoding]::ASCII.GetString($Packet[($Offset + 7)..($Offset + 7 + $VlanNameLength - 1)])
+                        while (($Cursor + 2) -le $TlvEnd) {
+                            if (($Cursor + 2) -gt $TlvEnd) {
+                                break
+                            }
+
+                            $VlanId = [BitConverter]::ToUInt16($Packet[($Cursor + 1)..$Cursor], 0)
+                            $VlanNameLength = [int]$Packet[($Cursor + 2)]
+                            $VlanNameStart = $Cursor + 3
+                            $VlanNameEnd = $VlanNameStart + $VlanNameLength - 1
+                            $VlanName = [string]::Empty
+
+                            if ($VlanNameLength -gt 0 -and $VlanNameEnd -le $TlvEnd) {
+                                $VlanName = [System.Text.Encoding]::ASCII.GetString($Packet[$VlanNameStart..$VlanNameEnd])
+                            }
+
+                            $Hash.VLANNamedEntries.Add([PSCustomObject]@{
+                                    VLANID = $VlanId
+                                    VLANName = $VlanName
+                                })
+
+                            if ($VlanNameLength -lt 0) {
+                                break
+                            }
+
+                            $Cursor = $VlanNameStart + [Math]::Max($VlanNameLength, 0)
                         }
-
-                        $Hash.VLANNamedEntries.Add([PSCustomObject]@{
-                                VLANID = $VlanId
-                                VLANName = $VlanName
-                            })
                     }
 
                     if ($OUI -eq '00-12-0F' -and $Subtype -eq 3 -and $Length -ge 9) {
