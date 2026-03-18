@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$ModulePath,
-    [string]$OutputPath
+    [string]$OutputPath,
+    [string]$ManifestPath
 )
 
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -11,21 +12,32 @@ if (-not $ModulePath) {
 if (-not $OutputPath) {
     $OutputPath = Join-Path $scriptRoot 'PSDiscoveryProtocol.SingleFile.ps1'
 }
+if (-not $ManifestPath) {
+    $ManifestPath = Join-Path $scriptRoot 'PSDiscoveryProtocol\PSDiscoveryProtocol.psd1'
+}
 
 if (-not (Test-Path -LiteralPath $ModulePath)) {
     throw "Module not found: $ModulePath"
 }
+if (-not (Test-Path -LiteralPath $ManifestPath)) {
+    throw "Manifest not found: $ManifestPath"
+}
 
 $moduleSource = Get-Content -Path $ModulePath -Raw
+$manifest = Import-PowerShellDataFile -Path $ManifestPath
+$moduleVersion = [string]$manifest.ModuleVersion
 
 $singleFile = @"
 [CmdletBinding()]
 param(
-    [ValidateSet('Invoke-DiscoveryProtocolCapture', 'Get-DiscoveryProtocolData', 'ConvertFrom-CDPPacket', 'ConvertFrom-LLDPPacket', 'Export-Pcap')]
+    [ValidateSet('Invoke-DiscoveryProtocolCapture', 'Get-DiscoveryProtocolData', 'ConvertFrom-CDPPacket', 'ConvertFrom-LLDPPacket', 'Export-Pcap', 'Get-PSDiscoveryProtocolVersion')]
     [string]`$Command,
     [hashtable]`$Arguments = @{},
-    [switch]`$ListCommands
+    [switch]`$ListCommands,
+    [switch]`$ShowVersion
 )
+
+`$script:PSDiscoveryProtocolVersion = '$moduleVersion'
 
 `$script:PSDiscoveryProtocolSource = @'
 $moduleSource
@@ -54,6 +66,14 @@ catch {
 
 if (`$ListCommands) {
     Get-Command -Module PSDiscoveryProtocol | Select-Object Name, CommandType
+    return
+}
+
+if (`$ShowVersion) {
+    [PSCustomObject]@{
+        Name = 'PSDiscoveryProtocol'
+        Version = `$script:PSDiscoveryProtocolVersion
+    }
     return
 }
 
@@ -100,6 +120,7 @@ do {
     Clear-Host
     Write-Host "========================================" -ForegroundColor Blue
     Write-Host "    Network Discovery Tool (CDP/LLDP)   " -ForegroundColor White
+    Write-Host ("    Version: {0}" -f `$script:PSDiscoveryProtocolVersion) -ForegroundColor DarkCyan
     Write-Host "========================================" -ForegroundColor Blue
     Write-Host "1. Capture CDP (Cisco)"
     Write-Host "2. Capture LLDP (Standard)"

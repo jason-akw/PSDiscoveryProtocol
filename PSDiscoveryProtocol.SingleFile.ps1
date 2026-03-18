@@ -1,10 +1,13 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Invoke-DiscoveryProtocolCapture', 'Get-DiscoveryProtocolData', 'ConvertFrom-CDPPacket', 'ConvertFrom-LLDPPacket', 'Export-Pcap')]
+    [ValidateSet('Invoke-DiscoveryProtocolCapture', 'Get-DiscoveryProtocolData', 'ConvertFrom-CDPPacket', 'ConvertFrom-LLDPPacket', 'Export-Pcap', 'Get-PSDiscoveryProtocolVersion')]
     [string]$Command,
     [hashtable]$Arguments = @{},
-    [switch]$ListCommands
+    [switch]$ListCommands,
+    [switch]$ShowVersion
 )
+
+$script:PSDiscoveryProtocolVersion = '1.5.0'
 
 $script:PSDiscoveryProtocolSource = @'
 #region classes
@@ -532,6 +535,46 @@ function Get-DiscoveryProtocolData {
     }
 
     end {}
+}
+#endregion
+
+#region function Get-PSDiscoveryProtocolVersion
+function Get-PSDiscoveryProtocolVersion {
+
+    <#
+
+.SYNOPSIS
+
+    Show module version information.
+
+.DESCRIPTION
+
+    Returns version metadata for the loaded PSDiscoveryProtocol module.
+
+#>
+
+    [CmdletBinding()]
+    param()
+
+    $Module = Get-Module -Name PSDiscoveryProtocol | Select-Object -First 1
+    if (-not $Module) {
+        $ManifestPath = Join-Path $PSScriptRoot 'PSDiscoveryProtocol.psd1'
+        if (Test-Path -LiteralPath $ManifestPath) {
+            $Manifest = Import-PowerShellDataFile -Path $ManifestPath
+            return [PSCustomObject]@{
+                Name = 'PSDiscoveryProtocol'
+                Version = [string]$Manifest.ModuleVersion
+                Path = $ManifestPath
+            }
+        }
+        throw 'PSDiscoveryProtocol module is not loaded.'
+    }
+
+    [PSCustomObject]@{
+        Name = $Module.Name
+        Version = [string]$Module.Version
+        Path = $Module.Path
+    }
 }
 #endregion
 
@@ -1691,6 +1734,14 @@ if ($ListCommands) {
     return
 }
 
+if ($ShowVersion) {
+    [PSCustomObject]@{
+        Name = 'PSDiscoveryProtocol'
+        Version = $script:PSDiscoveryProtocolVersion
+    }
+    return
+}
+
 if ($Command) {
     & $Command @Arguments
     return
@@ -1734,6 +1785,7 @@ do {
     Clear-Host
     Write-Host "========================================" -ForegroundColor Blue
     Write-Host "    Network Discovery Tool (CDP/LLDP)   " -ForegroundColor White
+    Write-Host ("    Version: {0}" -f $script:PSDiscoveryProtocolVersion) -ForegroundColor DarkCyan
     Write-Host "========================================" -ForegroundColor Blue
     Write-Host "1. Capture CDP (Cisco)"
     Write-Host "2. Capture LLDP (Standard)"

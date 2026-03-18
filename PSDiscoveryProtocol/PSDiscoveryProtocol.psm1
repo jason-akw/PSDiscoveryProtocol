@@ -526,6 +526,46 @@ function Get-DiscoveryProtocolData {
 }
 #endregion
 
+#region function Get-PSDiscoveryProtocolVersion
+function Get-PSDiscoveryProtocolVersion {
+
+    <#
+
+.SYNOPSIS
+
+    Show module version information.
+
+.DESCRIPTION
+
+    Returns version metadata for the loaded PSDiscoveryProtocol module.
+
+#>
+
+    [CmdletBinding()]
+    param()
+
+    $Module = Get-Module -Name PSDiscoveryProtocol | Select-Object -First 1
+    if (-not $Module) {
+        $ManifestPath = Join-Path $PSScriptRoot 'PSDiscoveryProtocol.psd1'
+        if (Test-Path -LiteralPath $ManifestPath) {
+            $Manifest = Import-PowerShellDataFile -Path $ManifestPath
+            return [PSCustomObject]@{
+                Name = 'PSDiscoveryProtocol'
+                Version = [string]$Manifest.ModuleVersion
+                Path = $ManifestPath
+            }
+        }
+        throw 'PSDiscoveryProtocol module is not loaded.'
+    }
+
+    [PSCustomObject]@{
+        Name = $Module.Name
+        Version = [string]$Module.Version
+        Path = $Module.Path
+    }
+}
+#endregion
+
 #region function ConvertFrom-CDPPacket
 function ConvertFrom-CDPPacket {
 
