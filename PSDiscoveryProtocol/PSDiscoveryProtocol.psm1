@@ -573,14 +573,22 @@ function ConvertFrom-CDPPacket {
         0x0001 = 'Device'
         0x0002 = 'IPAddress'
         0x0003 = 'Port'
+        0x0004 = 'Capabilities'
+        0x0005 = 'SoftwareVersion'
         0x0006 = 'Model'
         0x000A = 'VLAN'
+        0x000B = 'Duplex'
+        0x0012 = 'TrustBitmap'
+        0x0013 = 'UntrustedPortCoS'
+        0x0014 = 'SystemName'
         0x0016 = 'Management'
     }
 
-    $TypeString = 0x0001, 0x003, 0x006
+    $TypeString = 0x0001, 0x0003, 0x0005, 0x0006, 0x0014
     $TypeAddress = 0x0002, 0x0016
-    $TypeInt = 0x000A
+    $TypeByte = 0x000B, 0x0012, 0x0013
+    $TypeShort = 0x000A
+    $TypeInt = 0x0004
 
     $IPv4 = 0xCC
     $IPv6 = 0xAAAA0300000086DD
@@ -656,9 +664,19 @@ function ConvertFrom-CDPPacket {
                 }
             }
 
-            $TypeInt {
-                $NativeVlan = [System.BitConverter]::ToUInt16($Reader.ReadBytes(2)[1..0], 0)
-                $Properties.Add($Tlv.Item([int]$TlvType), $NativeVlan)
+            { $_ -in $TypeByte } {
+                $Value = $Reader.ReadBytes(1)[0]
+                $Properties.Add($Tlv.Item([int]$TlvType), $Value)
+            }
+
+            { $_ -in $TypeShort } {
+                $Value = [System.BitConverter]::ToUInt16($Reader.ReadBytes(2)[1..0], 0)
+                $Properties.Add($Tlv.Item([int]$TlvType), $Value)
+            }
+
+            { $_ -in $TypeInt } {
+                $Value = [System.BitConverter]::ToUInt32($Reader.ReadBytes(4)[3..0], 0)
+                $Properties.Add($Tlv.Item([int]$TlvType), $Value)
             }
 
             default {
@@ -730,6 +748,7 @@ function ConvertFrom-LLDPPacket {
             PortDescription      = 4
             SystemName           = 5
             SystemDescription    = 6
+            SystemCapabilities   = 7
             ManagementAddress    = 8
             OrganizationSpecific = 127
         }
@@ -749,6 +768,19 @@ function ConvertFrom-LLDPPacket {
         $Offset = 14
         $Mask = 0x01FF
         $Hash = @{}
+        $CapabilityMap = @{
+            0x0001 = 'Other'
+            0x0002 = 'Repeater'
+            0x0004 = 'Bridge'
+            0x0008 = 'WLANAccessPoint'
+            0x0010 = 'Router'
+            0x0020 = 'Telephone'
+            0x0040 = 'DOCSIS'
+            0x0080 = 'StationOnly'
+            0x0100 = 'CVLAN'
+            0x0200 = 'SVLAN'
+            0x0400 = 'TwoPortMacRelay'
+        }
 
         while ($Offset -lt $Packet.Length) {
             $Type = $Packet[$Offset] -shr 1
@@ -758,6 +790,9 @@ function ConvertFrom-LLDPPacket {
             switch ($Type) {
                 $TlvType.ChassisId {
                     $Subtype = $Packet[($Offset)]
+                    if (-not $Hash.ContainsKey('ChassisIdSubtype')) {
+                        $Hash.Add('ChassisIdSubtype', $Subtype)
+                    }
 
                     if ($SubType -in (1, 2, 3, 6, 7)) {
                         $Hash.Add('ChassisId', [System.Text.Encoding]::ASCII.GetString($Packet[($Offset + 1)..($Offset + $Length - 1)]))
@@ -793,6 +828,9 @@ function ConvertFrom-LLDPPacket {
 
                 $TlvType.PortId {
                     $Subtype = $Packet[($Offset)]
+                    if (-not $Hash.ContainsKey('PortIdSubtype')) {
+                        $Hash.Add('PortIdSubtype', $Subtype)
+                    }
 
                     if ($SubType -in (1, 2, 5, 6, 7)) {
                         $Hash.Add('Port', [System.Text.Encoding]::ASCII.GetString($Packet[($Offset + 1)..($Offset + $Length - 1)]))
@@ -850,6 +888,33 @@ function ConvertFrom-LLDPPacket {
                     break
                 }
 
+                $TlvType.SystemCapabilities {
+                    $SupportedMask = [BitConverter]::ToUInt16($Packet[($Offset + 1)..$Offset], 0)
+                    $EnabledMask = [BitConverter]::ToUInt16($Packet[($Offset + 3)..($Offset + 2)], 0)
+
+                    $Supported = New-Object System.Collections.Generic.List[String]
+                    $Enabled = New-Object System.Collections.Generic.List[String]
+
+                    foreach ($Capability in $CapabilityMap.GetEnumerator()) {
+                        if (($SupportedMask -band $Capability.Key) -ne 0) {
+                            $Supported.Add($Capability.Value)
+                        }
+                        if (($EnabledMask -band $Capability.Key) -ne 0) {
+                            $Enabled.Add($Capability.Value)
+                        }
+                    }
+
+                    if (-not $Hash.ContainsKey('SystemCapabilities')) {
+                        $Hash.Add('SystemCapabilities', $Supported)
+                    }
+                    if (-not $Hash.ContainsKey('EnabledCapabilities')) {
+                        $Hash.Add('EnabledCapabilities', $Enabled)
+                    }
+
+                    $Offset += $Length
+                    break
+                }
+
                 $TlvType.ManagementAddress {
                     $AddrLen = $Packet[($Offset)]
                     $Subtype = $Packet[($Offset + 1)]
@@ -874,6 +939,33 @@ function ConvertFrom-LLDPPacket {
                         Write-Verbose "Hex            : $Hex"
                         Write-Verbose "Ascii          : $Ascii"
                         Write-Verbose "----------------------------------------------------------------"
+                    }
+
+                    $TlvEndOffset = $Offset + $Length - 1
+                    $InterfaceNumberingSubtypeOffset = $Offset + $AddrLen + 1
+                    $InterfaceNumberOffset = $InterfaceNumberingSubtypeOffset + 1
+                    $OidLengthOffset = $InterfaceNumberOffset + 4
+
+                    if ($OidLengthOffset -le $TlvEndOffset) {
+                        $InterfaceNumberingSubtype = $Packet[$InterfaceNumberingSubtypeOffset]
+                        $InterfaceNumber = [BitConverter]::ToUInt32($Packet[($InterfaceNumberOffset + 3)..$InterfaceNumberOffset], 0)
+                        $ObjectIdentifierLength = $Packet[$OidLengthOffset]
+
+                        if (-not $Hash.ContainsKey('ManagementInterfaceNumberingSubtype')) {
+                            $Hash.Add('ManagementInterfaceNumberingSubtype', $InterfaceNumberingSubtype)
+                        }
+
+                        if (-not $Hash.ContainsKey('ManagementInterfaceNumber')) {
+                            $Hash.Add('ManagementInterfaceNumber', $InterfaceNumber)
+                        }
+
+                        if (
+                            $ObjectIdentifierLength -gt 0 -and
+                            ($OidLengthOffset + $ObjectIdentifierLength) -le $TlvEndOffset -and
+                            -not $Hash.ContainsKey('ManagementObjectIdentifier')
+                        ) {
+                            $Hash.Add('ManagementObjectIdentifier', [System.BitConverter]::ToString($Packet[($OidLengthOffset + 1)..($OidLengthOffset + $ObjectIdentifierLength)]))
+                        }
                     }
 
                     $Offset += $Length
